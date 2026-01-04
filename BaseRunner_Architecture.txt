@@ -1,0 +1,149 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     BaseRunner Architecture Overview                         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Nice idea, but ended up forking for Lua Runner anyway.
+So take with a pinch of salt.
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ BEFORE: Duplicate Code in Every Runner                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ BasicRunner2    │      │ LuaRunner2      │      │AppleScriptRunner│
+    │   (955 lines)   │      │   (436 lines)   │      │   (585 lines)   │
+    ├─────────────────┤      ├─────────────────┤      ├─────────────────┤
+    │ ❌ No menu bar  │      │ ❌ No menu bar  │      │ ❌ No menu bar  │
+    │ ❌ No Cmd+Q     │      │ ❌ No Cmd+Q     │      │ ❌ No Cmd+Q     │
+    │                 │      │                 │      │                 │
+    │ Framework init  │      │ Framework init  │      │ Framework init  │
+    │   (duplicate)   │      │   (duplicate)   │      │   (duplicate)   │
+    │                 │      │                 │      │                 │
+    │ BASIC logic     │      │ Lua logic       │      │ AppleScript     │
+    │                 │      │                 │      │   logic         │
+    │ Render loop     │      │ Render loop     │      │ Render loop     │
+    │   (duplicate)   │      │   (duplicate)   │      │   (duplicate)   │
+    │                 │      │                 │      │                 │
+    │ Shutdown        │      │ Shutdown        │      │ Shutdown        │
+    │   (duplicate)   │      │   (duplicate)   │      │   (duplicate)   │
+    └─────────────────┘      └─────────────────┘      └─────────────────┘
+
+    PROBLEMS:
+    • ~800 lines of duplicate code across runners
+    • No standard menu bar
+    • No quit keyboard shortcuts
+    • Hard to add new features consistently
+    • Maintenance nightmare
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ AFTER: BaseRunner Base Class                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                        ┌─────────────────────────┐
+                        │     BaseRunner          │
+                        │    (437 lines)          │
+                        │  [Shared by all]        │
+                        ├─────────────────────────┤
+                        │ ✅ Menu bar setup       │
+                        │ ✅ Cmd+Q / Cmd+W        │
+                        │ ✅ Framework init       │
+                        │ ✅ Render loop (60 FPS) │
+                        │ ✅ Thread management    │
+                        │ ✅ Shutdown handling    │
+                        │ ✅ Error dialogs        │
+                        └───────────┬─────────────┘
+                                    │ inherits
+                     ┌──────────────┼──────────────┐
+                     │              │              │
+            ┌────────▼──────┐  ┌───▼────────┐  ┌──▼──────────────┐
+            │BasicRunner2   │  │LuaRunner2  │  │AppleScriptRunner│
+            │  (~250 lines) │  │ (187 lines)│  │   (~220 lines)  │
+            ├───────────────┤  ├────────────┤  ├─────────────────┤
+            │ BASIC runtime │  │ Lua runtime│  │ AppleScript     │
+            │ BASIC exec    │  │ Lua exec   │  │   runtime       │
+            │ BASIC cleanup │  │ Lua cleanup│  │ AppleScript exec│
+            └───────────────┘  └────────────┘  └─────────────────┘
+                 74% less         57% less          62% less
+
+    BENEFITS:
+    • ✅ ~1000+ lines of duplicate code eliminated
+    • ✅ Standard macOS menu bar on all runners
+    • ✅ Cmd+Q works everywhere
+    • ✅ Consistent behavior across all runners
+    • ✅ New features added once, work everywhere
+    • ✅ Subclasses only contain language-specific code
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Subclass Implementation (Only 3 methods needed!)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    @interface MyNewRunner : BaseRunner
+    @end
+
+    @implementation MyNewRunner {
+        MyRuntimeState* _runtime;
+    }
+
+    // 1. Initialize runtime
+    - (BOOL)initializeRuntime {
+        _runtime = my_runtime_create();
+        return YES;
+    }
+
+    // 2. Execute script
+    - (BOOL)loadAndExecuteScript {
+        return my_runtime_execute(_runtime, self.scriptPath.c_str());
+    }
+
+    // 3. Cleanup
+    - (void)cleanupRuntime {
+        my_runtime_destroy(_runtime);
+    }
+
+    @end
+
+    That's it! BaseRunner handles everything else automatically.
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Menu Structure (Automatic on All Runners)                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ Application Menu                                                    │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │ About <RunnerName>                                                  │
+    │ ─────────────────────────────────────────────────────────────────── │
+    │ Hide <RunnerName>                                 Cmd+H             │
+    │ Hide Others                                       Cmd+Opt+H         │
+    │ Show All                                                            │
+    │ ─────────────────────────────────────────────────────────────────── │
+    │ Quit <RunnerName>                                 Cmd+Q    ← NEW!  │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ File Menu                                                           │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │ Close Window                                      Cmd+W             │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ Edit Menu                                                           │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │ Cut                                               Cmd+X             │
+    │ Copy                                              Cmd+C             │
+    │ Paste                                             Cmd+V             │
+    │ Select All                                        Cmd+A             │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ Window Menu                                                         │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │ Minimize                                          Cmd+M             │
+    │ Zoom                                                                │
+    │ ─────────────────────────────────────────────────────────────────── │
+    │ Bring All to Front                                                  │
+    └─────────────────────────────────────────────────────────────────────┘
