@@ -1,0 +1,771 @@
+//
+// st_api_video_image.mm
+// SuperTerminal v2.0
+//
+// Video mode image loading and saving API
+// Supports loading PNG files into XRES/WRES/PRES buffers and saving buffers to PNG
+//
+
+#include "superterminal_api.h"
+#include "st_api_context.h"
+#include "../Display/DisplayManager.h"
+#include "../Display/VideoMode/VideoModeManager.h"
+#include "../Display/XResBuffer.h"
+#include "../Display/WResBuffer.h"
+#include "../Display/PResBuffer.h"
+#include "../Display/XResPaletteManager.h"
+#include "../Display/WResPaletteManager.h"
+#include "../Display/PResPaletteManager.h"
+
+#import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
+
+namespace {
+
+// Helper to load PNG and get dimensions and pixel data
+// Optionally extract embedded palette if extractPalette is true
+bool loadPNGFile(const char* filePath, std::vector<uint8_t>& pixels,
+                 int& width, int& height, int& bitsPerPixel,
+                 std::vector<uint8_t>* paletteRGB = nullptr) {
+    if (!filePath) {
+        return false;
+    }
+
+    NSString* path = [NSString stringWithUTF8String:filePath];
+    NSURL* url = [NSURL fileURLWithPath:path];
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!source) {
+        NSLog(@"[load_image] Failed to create image source from: %@", path);
+        return false;
+    }
+
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+
+    if (!image) {
+        NSLog(@"[load_image] Failed to load image from: %@", path);
+        return false;
+    }
+
+    width = (int)CGImageGetWidth(image);
+    height = (int)CGImageGetHeight(image);
+    bitsPerPixel = (int)CGImageGetBitsPerPixel(image);
+
+    // Check if image is indexed color (8-bit)
+    CGColorSpaceRef colorSpace = CGImageGetColorSpace(image);
+    CGColorSpaceModel colorModel = CGColorSpaceGetModel(colorSpace);
+    bool isIndexed = (colorModel == kCGColorSpaceModelIndexed);
+
+    NSLog(@"[load_image] Image: %dx%d, %d bpp, indexed=%d", width, height, bitsPerPixel, isIndexed);
+
+    // Extract embedded palette if requested and image is indexed
+    if (paletteRGB && isIndexed) {
+        CGColorSpaceRef baseSpace = CGColorSpaceGetBaseColorSpace(colorSpace);
+        const uint8_t* colorTable = (const uint8_t*)CGColorSpaceGetColorTable(colorSpace);
+        size_t colorCount = CGColorSpaceGetColorTableCount(colorSpace);
+
+        if (colorTable && colorCount > 0) {
+            paletteRGB->resize(768);  // Always 256 colors × 3 bytes
+
+            // Copy available palette entries
+            size_t copyCount = (colorCount < 256) ? colorCount : 256;
+            memcpy(paletteRGB->data(), colorTable, copyCount * 3);
+
+            // Fill remaining entries with black if fewer than 256 colors
+            if (copyCount < 256) {
+                memset(paletteRGB->data() + copyCount * 3, 0, (256 - copyCount) * 3);
+            }
+
+            NSLog(@"[load_image] Extracted %zu-color palette from PNG", colorCount);
+        } else {
+            NSLog(@"[load_image] Warning: Indexed image has no embedded palette");
+        }
+    }
+
+    // Allocate pixel buffer
+    size_t bytesPerPixel = isIndexed ? 1 : 4;
+    pixels.resize(width * height * bytesPerPixel);
+
+    if (isIndexed) {
+        // Load as indexed color (8-bit)
+        CGContextRef context = CGBitmapContextCreate(
+            pixels.data(),
+            width,
+            height,
+            8,
+            width,
+            colorSpace,
+            (CGBitmapInfo)kCGImageAlphaNone
+        );
+
+        if (!context) {
+            NSLog(@"[load_image] Failed to create indexed bitmap context");
+            CGImageRelease(image);
+            return false;
+        }
+
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+        CGContextRelease(context);
+        bitsPerPixel = 8;
+    } else {
+        // Load as RGBA
+        CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = CGBitmapContextCreate(
+            pixels.data(),
+            width,
+            height,
+            8,
+            width * 4,
+            rgbColorSpace,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
+        );
+        CGColorSpaceRelease(rgbColorSpace);
+
+        if (!context) {
+            NSLog(@"[load_image] Failed to create RGBA bitmap context");
+            CGImageRelease(image);
+            return false;
+        }
+
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+        CGContextRelease(context);
+        bitsPerPixel = 32;
+    }
+
+    CGImageRelease(image);
+    return true;
+}
+
+// Helper to save PNG file with optional palette data
+bool savePNGFile(const char* filePath, const uint8_t* pixels,
+                 int width, int height, bool isIndexed, const uint8_t* paletteRGB = nullptr) {
+    if (!filePath || !pixels) {
+        return false;
+    }
+
+    NSString* path = [NSString stringWithUTF8String:filePath];
+    NSURL* url = [NSURL fileURLWithPath:path];
+
+    CGImageRef image = nullptr;
+
+    if (isIndexed && paletteRGB) {
+        // Create indexed color space with embedded palette (256 colors × 3 bytes RGB)
+        CGColorSpaceRef baseSpace = CGColorSpaceCreateDeviceRGB();
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateIndexed(
+            baseSpace,
+            255,  // lastIndex (0-255 = 256 colors)
+            paletteRGB
+        );
+        CGColorSpaceRelease(baseSpace);
+
+        CGDataProviderRef provider = CGDataProviderCreateWithData(
+            NULL,
+            pixels,
+            width * height,
+            NULL
+        );
+
+        image = CGImageCreate(
+            width,
+            height,
+            8,      // bitsPerComponent
+            8,      // bitsPerPixel
+            width,  // bytesPerRow
+            colorSpace,
+            (CGBitmapInfo)kCGImageAlphaNone,
+            provider,
+            NULL,   // decode array
+            false,  // shouldInterpolate
+            kCGRenderingIntentDefault
+        );
+
+        CGDataProviderRelease(provider);
+        CGColorSpaceRelease(colorSpace);
+</text>
+    } else {
+        // Create RGBA image
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef provider = CGDataProviderCreateWithData(
+            NULL,
+            pixels,
+            width * height * 4,
+            NULL
+        );
+
+        image = CGImageCreate(
+            width,
+            height,
+            8,
+            32,
+            width * 4,
+            colorSpace,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+            provider,
+            NULL,
+            false,
+            kCGRenderingIntentDefault
+        );
+
+        CGDataProviderRelease(provider);
+        CGColorSpaceRelease(colorSpace);
+    }
+
+    if (!image) {
+        NSLog(@"[save_image] Failed to create CGImage");
+        return false;
+    }
+
+    CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)url,
+        kUTTypePNG,
+        1,
+        NULL
+    );
+
+    if (!destination) {
+        NSLog(@"[save_image] Failed to create image destination");
+        CGImageRelease(image);
+        return false;
+    }
+
+    CGImageDestinationAddImage(destination, image, NULL);
+
+    bool success = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+    CGImageRelease(image);
+
+    if (success) {
+        NSLog(@"[save_image] PNG saved: %@", path);
+    } else {
+        NSLog(@"[save_image] Failed to write PNG: %@", path);
+    }
+
+    return success;
+}
+
+// Helper to save palette to .pal file
+// Format: "STPAL" (5 bytes) + version (1 byte) + 240 colors × 3 bytes RGB = 726 bytes
+bool savePaletteFile(const char* filePath, SuperTerminal::VideoMode mode,
+                     STApi::Context& context) {
+    if (!filePath) {
+        return false;
+    }
+
+    std::vector<uint8_t> data;
+    data.reserve(726);
+
+    // Header: "STPAL" + version byte
+    data.push_back('S');
+    data.push_back('T');
+    data.push_back('P');
+    data.push_back('A');
+    data.push_back('L');
+    data.push_back(1);  // Version 1
+
+    // Get palette data (240 colors, indices 16-255)
+    for (int i = 16; i < 256; i++) {
+        uint32_t rgba = 0;
+
+        switch (mode) {
+            case SuperTerminal::VideoMode::XRES: {
+                auto paletteMgr = context.xresPalette();
+                if (paletteMgr) {
+                    rgba = paletteMgr->getGlobalColor(i);
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::WRES: {
+                auto paletteMgr = context.wresPalette();
+                if (paletteMgr) {
+                    rgba = paletteMgr->getGlobalColor(i);
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::PRES: {
+                auto paletteMgr = context.presPalette();
+                if (paletteMgr) {
+                    rgba = paletteMgr->getGlobalColor(i);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        // Extract RGB (palette stores ARGB)
+        uint8_t r = (rgba >> 16) & 0xFF;
+        uint8_t g = (rgba >> 8) & 0xFF;
+        uint8_t b = rgba & 0xFF;
+
+        data.push_back(r);
+        data.push_back(g);
+        data.push_back(b);
+    }
+
+    // Write to file
+    NSString* path = [NSString stringWithUTF8String:filePath];
+    NSData* nsData = [NSData dataWithBytes:data.data() length:data.size()];
+    BOOL success = [nsData writeToFile:path atomically:YES];
+
+    if (success) {
+        NSLog(@"[save_palette] Palette saved: %@", path);
+    } else {
+        NSLog(@"[save_palette] Failed to write palette: %@", path);
+    }
+
+    return success;
+}
+
+// Helper to load palette from .pal file
+bool loadPaletteFile(const char* filePath, SuperTerminal::VideoMode mode,
+                     STApi::Context& context) {
+    if (!filePath) {
+        return false;
+    }
+
+    NSString* path = [NSString stringWithUTF8String:filePath];
+    NSData* nsData = [NSData dataWithContentsOfFile:path];
+
+    if (!nsData) {
+        NSLog(@"[load_palette] Failed to read file: %@", path);
+        return false;
+    }
+
+    const uint8_t* data = (const uint8_t*)[nsData bytes];
+    size_t length = [nsData length];
+
+    // Verify header and size
+    if (length != 726) {
+        NSLog(@"[load_palette] Invalid file size: %zu (expected 726)", length);
+        return false;
+    }
+
+    if (data[0] != 'S' || data[1] != 'T' || data[2] != 'P' ||
+        data[3] != 'A' || data[4] != 'L') {
+        NSLog(@"[load_palette] Invalid file header");
+        return false;
+    }
+
+    uint8_t version = data[5];
+    if (version != 1) {
+        NSLog(@"[load_palette] Unsupported version: %d", version);
+        return false;
+    }
+
+    // Load palette data (240 colors, indices 16-255)
+    const uint8_t* palette = data + 6;
+    for (int i = 16; i < 256; i++) {
+        int offset = (i - 16) * 3;
+        uint8_t r = palette[offset];
+        uint8_t g = palette[offset + 1];
+        uint8_t b = palette[offset + 2];
+        uint32_t rgba = 0xFF000000 | (r << 16) | (g << 8) | b;
+
+        switch (mode) {
+            case SuperTerminal::VideoMode::XRES: {
+                auto paletteMgr = context.xresPalette();
+                if (paletteMgr) {
+                    paletteMgr->setGlobalColor(i, rgba);
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::WRES: {
+                auto paletteMgr = context.wresPalette();
+                if (paletteMgr) {
+                    paletteMgr->setGlobalColor(i, rgba);
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::PRES: {
+                auto paletteMgr = context.presPalette();
+                if (paletteMgr) {
+                    paletteMgr->setGlobalColor(i, rgba);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    NSLog(@"[load_palette] Palette loaded: %@", path);
+    return true;
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// C API Implementation
+// =============================================================================
+
+ST_API bool st_video_load_image(const char* filePath, int bufferID,
+                                 int destX, int destY, int maxWidth, int maxHeight) {
+    ST_LOCK;
+
+    auto display = STApi::Context::instance().display();
+    if (!display) {
+        ST_SET_ERROR("DisplayManager not initialized");
+        return false;
+    }
+
+    auto videoModeManager = display->getVideoModeManager();
+    if (!videoModeManager) {
+        ST_SET_ERROR("VideoModeManager not initialized");
+        return false;
+    }
+
+    SuperTerminal::VideoMode currentMode = videoModeManager->getVideoMode();
+
+    // Load image file with optional palette extraction
+    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> extractedPalette;
+    int imgWidth = 0, imgHeight = 0, bitsPerPixel = 0;
+
+    if (!loadPNGFile(filePath, pixels, imgWidth, imgHeight, bitsPerPixel,
+                     applyPalette ? &extractedPalette : nullptr)) {
+        ST_SET_ERROR("Failed to load image file");
+        return false;
+    }
+
+    // If palette was extracted and applyPalette is true, apply it to current mode
+    if (applyPalette && !extractedPalette.empty()) {
+        NSLog(@"[load_image] Applying extracted palette to current video mode");
+
+        switch (currentMode) {
+            case SuperTerminal::VideoMode::XRES: {
+                auto paletteMgr = STApi::Context::instance().xresPalette();
+                if (paletteMgr) {
+                    for (int i = 0; i < 256; i++) {
+                        uint8_t r = extractedPalette[i * 3 + 0];
+                        uint8_t g = extractedPalette[i * 3 + 1];
+                        uint8_t b = extractedPalette[i * 3 + 2];
+                        uint32_t rgba = (r << 24) | (g << 16) | (b << 8) | 0xFF;
+                        paletteMgr->setGlobalColor(i, rgba);
+                    }
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::WRES: {
+                auto paletteMgr = STApi::Context::instance().wresPalette();
+                if (paletteMgr) {
+                    for (int i = 0; i < 256; i++) {
+                        uint8_t r = extractedPalette[i * 3 + 0];
+                        uint8_t g = extractedPalette[i * 3 + 1];
+                        uint8_t b = extractedPalette[i * 3 + 2];
+                        uint32_t rgba = (r << 24) | (g << 16) | (b << 8) | 0xFF;
+                        paletteMgr->setGlobalColor(i, rgba);
+                    }
+                }
+                break;
+            }
+            case SuperTerminal::VideoMode::PRES: {
+                auto paletteMgr = STApi::Context::instance().presPalette();
+                if (paletteMgr) {
+                    // For PRES, only apply global palette (indices 16-255)
+                    for (int i = 16; i < 256; i++) {
+                        uint8_t r = extractedPalette[i * 3 + 0];
+                        uint8_t g = extractedPalette[i * 3 + 1];
+                        uint8_t b = extractedPalette[i * 3 + 2];
+                        uint32_t rgba = (r << 24) | (g << 16) | (b << 8) | 0xFF;
+                        paletteMgr->setGlobalColor(i, rgba);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    // Determine actual copy dimensions
+    int copyWidth = (maxWidth > 0) ? std::min(maxWidth, imageWidth) : imageWidth;
+    int copyHeight = (maxHeight > 0) ? std::min(maxHeight, imageHeight) : imageHeight;
+
+    // Load based on current video mode
+    switch (currentMode) {
+        case SuperTerminal::VideoMode::XRES: {
+            if (bitsPerPixel != 8) {
+                ST_SET_ERROR("XRES mode requires 8-bit indexed PNG");
+                return false;
+            }
+
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid XRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getXResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("XRES buffer not available");
+                return false;
+            }
+
+            // Copy pixels to XRES buffer
+            for (int y = 0; y < copyHeight; y++) {
+                for (int x = 0; x < copyWidth; x++) {
+                    if (destX + x >= 0 && destX + x < 320 &&
+                        destY + y >= 0 && destY + y < 240) {
+                        uint8_t colorIndex = pixels[y * imageWidth + x];
+                        buffer->setPixel(destX + x, destY + y, colorIndex);
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        case SuperTerminal::VideoMode::WRES: {
+            if (bitsPerPixel != 8) {
+                ST_SET_ERROR("WRES mode requires 8-bit indexed PNG");
+                return false;
+            }
+
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid WRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getWResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("WRES buffer not available");
+                return false;
+            }
+
+            // Copy pixels to WRES buffer
+            for (int y = 0; y < copyHeight; y++) {
+                for (int x = 0; x < copyWidth; x++) {
+                    if (destX + x >= 0 && destX + x < 432 &&
+                        destY + y >= 0 && destY + y < 240) {
+                        uint8_t colorIndex = pixels[y * imageWidth + x];
+                        buffer->setPixel(destX + x, destY + y, colorIndex);
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        case SuperTerminal::VideoMode::PRES: {
+            if (bitsPerPixel != 8) {
+                ST_SET_ERROR("PRES mode requires 8-bit indexed PNG");
+                return false;
+            }
+
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid PRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getPResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("PRES buffer not available");
+                return false;
+            }
+
+            // Copy pixels to PRES buffer
+            for (int y = 0; y < copyHeight; y++) {
+                for (int x = 0; x < copyWidth; x++) {
+                    if (destX + x >= 0 && destX + x < 1280 &&
+                        destY + y >= 0 && destY + y < 720) {
+                        uint8_t colorIndex = pixels[y * imageWidth + x];
+                        buffer->setPixel(destX + x, destY + y, colorIndex);
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        default:
+            ST_SET_ERROR("Current video mode does not support load_image (use XRES, WRES, or PRES)");
+            return false;
+    }
+}
+
+ST_API bool st_video_save_palette_file(const char* filePath) {
+    ST_LOCK;
+
+    auto display = STApi::Context::instance().display();
+    if (!display) {
+        ST_SET_ERROR("DisplayManager not initialized");
+        return false;
+    }
+
+    auto videoModeManager = display->getVideoModeManager();
+    if (!videoModeManager) {
+        ST_SET_ERROR("VideoModeManager not initialized");
+        return false;
+    }
+
+    SuperTerminal::VideoMode currentMode = videoModeManager->getVideoMode();
+
+    // Check if current mode supports palettes
+    if (currentMode != SuperTerminal::VideoMode::XRES &&
+        currentMode != SuperTerminal::VideoMode::WRES &&
+        currentMode != SuperTerminal::VideoMode::PRES) {
+        ST_SET_ERROR("Current video mode does not support palettes (use XRES, WRES, or PRES)");
+        return false;
+    }
+
+    return savePaletteFile(filePath, currentMode, STApi::Context::instance());
+}
+
+ST_API bool st_video_load_palette_file(const char* filePath) {
+    ST_LOCK;
+
+    auto display = STApi::Context::instance().display();
+    if (!display) {
+        ST_SET_ERROR("DisplayManager not initialized");
+        return false;
+    }
+
+    auto videoModeManager = display->getVideoModeManager();
+    if (!videoModeManager) {
+        ST_SET_ERROR("VideoModeManager not initialized");
+        return false;
+    }
+
+    SuperTerminal::VideoMode currentMode = videoModeManager->getVideoMode();
+
+    // Check if current mode supports palettes
+    if (currentMode != SuperTerminal::VideoMode::XRES &&
+        currentMode != SuperTerminal::VideoMode::WRES &&
+        currentMode != SuperTerminal::VideoMode::PRES) {
+        ST_SET_ERROR("Current video mode does not support palettes (use XRES, WRES, or PRES)");
+        return false;
+    }
+
+    return loadPaletteFile(filePath, currentMode, STApi::Context::instance());
+}
+
+ST_API bool st_video_load_image(const char* filePath, int bufferID) {
+    return st_video_load_image_ex(filePath, bufferID, false);
+}
+
+ST_API bool st_video_load_image_ex(const char* filePath, int bufferID, bool applyPalette) {
+    ST_LOCK;
+
+    auto display = STApi::Context::instance().display();
+    if (!display) {
+        ST_SET_ERROR("DisplayManager not initialized");
+        return false;
+    }
+
+    auto videoModeManager = display->getVideoModeManager();
+    if (!videoModeManager) {
+        ST_SET_ERROR("VideoModeManager not initialized");
+        return false;
+    }
+
+    SuperTerminal::VideoMode currentMode = videoModeManager->getVideoMode();
+
+    // Save based on current video mode
+    switch (currentMode) {
+        case SuperTerminal::VideoMode::XRES: {
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid XRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getXResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("XRES buffer not available");
+                return false;
+            }
+
+            // Get pixel data (320x240, 8-bit indexed)
+            const uint8_t* pixels = buffer->getPixelData();
+
+            // Build palette data (256 colors × 3 bytes RGB)
+            std::vector<uint8_t> paletteRGB(768);
+            auto paletteMgr = STApi::Context::instance().xresPalette();
+            if (paletteMgr) {
+                for (int i = 0; i < 256; i++) {
+                    uint32_t rgba = paletteMgr->getGlobalColor(i);
+                    paletteRGB[i * 3 + 0] = (rgba >> 24) & 0xFF;  // R
+                    paletteRGB[i * 3 + 1] = (rgba >> 16) & 0xFF;  // G
+                    paletteRGB[i * 3 + 2] = (rgba >> 8) & 0xFF;   // B
+                }
+            }
+
+            return savePNGFile(filePath, pixels, 320, 240, true, paletteRGB.data());
+        }
+
+        case SuperTerminal::VideoMode::WRES: {
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid WRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getWResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("WRES buffer not available");
+                return false;
+            }
+
+            // Get pixel data (640x240, 8-bit indexed)
+            const uint8_t* pixels = buffer->getPixelData();
+
+            // Build palette data (256 colors × 3 bytes RGB)
+            std::vector<uint8_t> paletteRGB(768);
+            auto paletteMgr = STApi::Context::instance().wresPalette();
+            if (paletteMgr) {
+                for (int i = 0; i < 256; i++) {
+                    uint32_t rgba = paletteMgr->getGlobalColor(i);
+                    paletteRGB[i * 3 + 0] = (rgba >> 24) & 0xFF;  // R
+                    paletteRGB[i * 3 + 1] = (rgba >> 16) & 0xFF;  // G
+                    paletteRGB[i * 3 + 2] = (rgba >> 8) & 0xFF;   // B
+                }
+            }
+
+            return savePNGFile(filePath, pixels, 640, 240, true, paletteRGB.data());
+        }
+
+        case SuperTerminal::VideoMode::PRES: {
+            if (bufferID < 0 || bufferID >= 8) {
+                ST_SET_ERROR("Invalid PRES buffer ID (must be 0-7)");
+                return false;
+            }
+
+            auto buffer = display->getPResBuffer(bufferID);
+            if (!buffer) {
+                ST_SET_ERROR("PRES buffer not available");
+                return false;
+            }
+
+            // Get pixel data (640x480, 8-bit indexed)
+            const uint8_t* pixels = buffer->getPixelData();
+
+            // Build palette data (256 colors × 3 bytes RGB)
+            // PRES uses 16 per-row colors (0-15) + 240 global colors (16-255)
+            // For simplicity, we'll export using the global palette for all indices
+            std::vector<uint8_t> paletteRGB(768);
+            auto paletteMgr = STApi::Context::instance().presPalette();
+            if (paletteMgr) {
+                // Indices 0-15: use row 0's palette (or could average/use most common)
+                for (int i = 0; i < 16; i++) {
+                    uint32_t rgba = paletteMgr->getRowColor(0, i);
+                    paletteRGB[i * 3 + 0] = (rgba >> 24) & 0xFF;  // R
+                    paletteRGB[i * 3 + 1] = (rgba >> 16) & 0xFF;  // G
+                    paletteRGB[i * 3 + 2] = (rgba >> 8) & 0xFF;   // B
+                }
+                // Indices 16-255: global palette
+                for (int i = 16; i < 256; i++) {
+                    uint32_t rgba = paletteMgr->getGlobalColor(i);
+                    paletteRGB[i * 3 + 0] = (rgba >> 24) & 0xFF;  // R
+                    paletteRGB[i * 3 + 1] = (rgba >> 16) & 0xFF;  // G
+                    paletteRGB[i * 3 + 2] = (rgba >> 8) & 0xFF;   // B
+                }
+            }
+
+            return savePNGFile(filePath, pixels, 640, 480, true, paletteRGB.data());
+        }
+
+        default:
+            ST_SET_ERROR("Current video mode does not support save_image (use XRES, WRES, or PRES)");
+            return false;
+    }
+}
+// Need these includes - adding at end
